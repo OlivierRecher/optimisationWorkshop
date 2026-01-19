@@ -31,6 +31,7 @@ const DEFAULT_ENDPOINTS = [
 const concurrency = Number(getArg("-c", "--concurrency", "10"));
 const timeout = Number(getArg("-t", "--timeout", "5000")); // ms
 const repeat = Number(getArg("-r", "--repeat", "1"));
+const totalRequests = Number(getArg("-n", "--total", "100")); // nouveau : nombre total de requêtes par run
 const endpointsArg = getArg("-e", "--endpoints", "");
 const endpoints = endpointsArg ? endpointsArg.split(",").map(s => s.trim()) : DEFAULT_ENDPOINTS;
 
@@ -46,6 +47,10 @@ function percentile(arr: number[], p: number) {
     return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
 }
 
+function pickRandom<T>(arr: T[]) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
 // Exécute une requête et mesure latence
 async function runSingleRequest(method: "get" | "post", endpoint: string, timeoutMs: number) {
     const url = BASE_URL + endpoint;
@@ -59,64 +64,100 @@ async function runSingleRequest(method: "get" | "post", endpoint: string, timeou
             resp = await axios.get(url, { timeout: timeoutMs });
         }
         const latency = Date.now() - start;
-        return { success: true, status: resp.status, latency };
+        return { success: true, status: resp.status, latency, endpoint };
     } catch (err: any) {
         const latency = Date.now() - start;
         return {
             success: false,
             error: err?.code || err?.message || "unknown",
             status: err?.response?.status,
-            latency
+            latency,
+            endpoint
         };
     }
 }
 
-// Benchmarker un endpoint avec N requêtes concurrentes
-async function benchmarkEndpoint(endpoint: string, concurrent: number, timeoutMs: number) {
-    const method: "get" | "post" = (endpoint === "/deposit" || endpoint === "/withdraw") ? "post" : "get";
+// Envoie des requêtes en batches (taille = concurrency), chaque requête choisit un endpoint aléatoire
+async function runRandomRequests(total: number, concurrencyLimit: number, timeoutMs: number) {
+    const results: any[] = [];
+    let sent = 0;
     const startAll = Date.now();
-    const promises: Promise<any>[] = [];
 
-    for (let i = 0; i < concurrent; i++) {
-        promises.push(runSingleRequest(method, endpoint, timeoutMs));
+    while (sent < total) {
+        const batchSize = Math.min(concurrencyLimit, total - sent);
+        const batchPromises: Promise<any>[] = [];
+        for (let i = 0; i < batchSize; i++) {
+            const ep = pickRandom(endpoints);
+            const method: "get" | "post" = (ep === "/deposit" || ep === "/withdraw") ? "post" : "get";
+            batchPromises.push(runSingleRequest(method, ep, timeoutMs));
+        }
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
+        sent += batchSize;
     }
 
-    const results = await Promise.all(promises);
     const duration = Date.now() - startAll;
+    return { results, durationMs: duration };
+}
 
-    const latencies = results.map(r => r.latency);
-    const successes = results.filter(r => r.success).length;
-    const failures = results.length - successes;
+// Agrège les résultats par endpoint et calcule métriques
+function aggregateByEndpoint(results: any[], durationMs: number) {
+    const groups: { [ep: string]: any[] } = {};
+    for (const r of results) {
+        groups[r.endpoint] = groups[r.endpoint] || [];
+        groups[r.endpoint].push(r);
+    }
 
-    const successLatencies = results.filter(r => r.success).map(r => r.latency);
+    const metricsByEndpoint: any[] = [];
+    for (const ep of Object.keys(groups)) {
+        const group = groups[ep];
+        const latencies = group.map(g => g.latency);
+        const successes = group.filter(g => g.success).length;
+        const failures = group.length - successes;
+        metricsByEndpoint.push({
+            endpoint: ep,
+            totalRequests: group.length,
+            successes,
+            failures,
+            durationMs,
+            throughputReqPerSec: +( (successes / (durationMs / 1000)) || 0 ).toFixed(2),
+            latency: {
+                min: latencies.length ? Math.min(...latencies) : 0,
+                max: latencies.length ? Math.max(...latencies) : 0,
+                avg: +avg(latencies).toFixed(2),
+                p50: percentile(latencies, 50),
+                p90: percentile(latencies, 90),
+                p99: percentile(latencies, 99)
+            }
+        });
+    }
 
-    const metrics = {
-        endpoint,
-        concurrent,
-        totalRequests: results.length,
-        successes,
-        failures,
-        durationMs: duration,
-        throughputReqPerSec: +( (successes / (duration / 1000)) || 0 ).toFixed(2),
-        latency: {
-            min: Math.min(...latencies),
-            max: Math.max(...latencies),
-            avg: +avg(latencies).toFixed(2),
-            p50: percentile(latencies, 50),
-            p90: percentile(latencies, 90),
-            p99: percentile(latencies, 99)
+    // Ensure endpoints with zero hits are present
+    for (const ep of endpoints) {
+        if (!metricsByEndpoint.find(m => m.endpoint === ep)) {
+            metricsByEndpoint.push({
+                endpoint: ep,
+                totalRequests: 0,
+                successes: 0,
+                failures: 0,
+                durationMs,
+                throughputReqPerSec: 0,
+                latency: { min: 0, max: 0, avg: 0, p50: 0, p90: 0, p99: 0 }
+            });
         }
-    };
+    }
 
-    return { metrics, raw: results };
+    // Tri pour affichage stable
+    metricsByEndpoint.sort((a, b) => a.endpoint.localeCompare(b.endpoint));
+    return metricsByEndpoint;
 }
 
 // Affichage formatté simple
 function printReportHeader() {
-    console.log("\n=== Benchmark report ===");
-    console.log(`Concurrency: ${concurrency}, Timeout: ${timeout}ms, Repeat: ${repeat}`);
-    console.log(`Endpoints: ${endpoints.join(", ")}`);
-    console.log("========================\n");
+    console.log("\n=== Benchmark report (random endpoints) ===");
+    console.log(`Concurrency: ${concurrency}, Timeout: ${timeout}ms, Repeat: ${repeat}, Total per run: ${totalRequests}`);
+    console.log(`Endpoints pool: ${endpoints.join(", ")}`);
+    console.log("==========================================\n");
 }
 
 function printMetricsRow(m: any) {
@@ -134,35 +175,76 @@ function printMetricsRow(m: any) {
     );
 }
 
-// Runner principal
+// Runner principal (random requests)
 async function runBenchmarks() {
     printReportHeader();
-    const allResults: any[] = [];
+    const allRunsSummary: any[] = [];
 
     for (let r = 0; r < repeat; r++) {
-        console.log(`--- Run ${r + 1}/${repeat} ---`);
-        for (const ep of endpoints) {
-            process.stdout.write(`Benchmarking ${ep} ... `);
-            const { metrics } = await benchmarkEndpoint(ep, concurrency, timeout);
-            process.stdout.write("done\n");
-            printMetricsRow(metrics);
-            allResults.push(metrics);
+        console.log(`--- Run ${r + 1}/${repeat} (total requests: ${totalRequests}) ---`);
+        const { results, durationMs } = await runRandomRequests(totalRequests, concurrency, timeout);
+        const metricsByEndpoint = aggregateByEndpoint(results, durationMs);
+
+        for (const m of metricsByEndpoint) {
+            printMetricsRow(m);
         }
+
+        allRunsSummary.push({ run: r + 1, durationMs, metricsByEndpoint });
+        console.log("");
     }
 
-    // Sommaire global
+    // Sommaire final
     console.log("\n=== Sommaire final ===");
     console.log("endpoint             total   succ    fail    time(ms)    thr/s       avgLat(ms)  p90(ms)     p99(ms)");
-    for (const m of allResults) {
+    // fusionner toutes les runs pour un sommaire global
+    const merged: { [ep: string]: any[] } = {};
+    for (const run of allRunsSummary) {
+        for (const m of run.metricsByEndpoint) {
+            merged[m.endpoint] = merged[m.endpoint] || [];
+            merged[m.endpoint].push(m);
+        }
+    }
+    const globalMetrics = Object.keys(merged).map(ep => {
+        const list = merged[ep];
+        const totalRequestsAll = list.reduce((s, x) => s + x.totalRequests, 0);
+        const successesAll = list.reduce((s, x) => s + x.successes, 0);
+        const failuresAll = list.reduce((s, x) => s + x.failures, 0);
+        // concat latencies
+        const latenciesAll: number[] = [];
+        for (const l of list) {
+            // we don't have the raw latencies list here, approximate using avg * count
+            for (let i = 0; i < l.totalRequests; i++) {
+                latenciesAll.push(l.latency.avg || 0);
+            }
+        }
+        const durationSum = allRunsSummary.reduce((s, x) => s + x.durationMs, 0) || 1;
+        return {
+            endpoint: ep,
+            totalRequests: totalRequestsAll,
+            successes: successesAll,
+            failures: failuresAll,
+            durationMs: durationSum,
+            throughputReqPerSec: +( (successesAll / (durationSum / 1000)) || 0 ).toFixed(2),
+            latency: {
+                min: latenciesAll.length ? Math.min(...latenciesAll) : 0,
+                max: latenciesAll.length ? Math.max(...latenciesAll) : 0,
+                avg: +(avg(latenciesAll) || 0).toFixed(2),
+                p50: percentile(latenciesAll, 50),
+                p90: percentile(latenciesAll, 90),
+                p99: percentile(latenciesAll, 99)
+            }
+        };
+    });
+
+    for (const m of globalMetrics) {
         printMetricsRow(m);
     }
 }
 
 // Exécution
 runBenchmarks()
-  .then((res) => {
-      console.log("\nBenchmark terminé");
-      process.exit();
+  .then(() => {
+      process.exit(0);
   })
   .catch(err => {
     console.error("Erreur lors du benchmark :", err);
